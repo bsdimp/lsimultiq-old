@@ -1,0 +1,26 @@
+ident BEAKER
+include GENERIC
+
+nooptions WITNESS
+nooptions WITNESS_SKIPSPIN
+nooptions INVARIANTS
+nooptions INVARIANTS_SUPPORT
+nooptions DEADLKRES
+
+#nooptions 	DDB_CTF
+#nooptions 	KDTRACE_FRAME
+#nooptions 	KDTRACE_HOOKS
+options 	KDB_UNATTENDED
+
+#options 	NETGRAPH		# netgraph(4) system
+#options 	NETGRAPH_DEBUG		# enable extra debugging, this
+#					# affects netgraph(4) and nodes
+#options 	NETGRAPH_SOCKET
+#options 	NETGRAPH_BLUETOOTH		# ng_bluetooth(4)
+#options 	NETGRAPH_BLUETOOTH_HCI		# ng_hci(4)
+#options 	NETGRAPH_BLUETOOTH_L2CAP	# ng_l2cap(4)
+#options 	NETGRAPH_BLUETOOTH_SOCKET	# ng_btsocket(4)
+#options 	NETGRAPH_BLUETOOTH_UBT
+
+device 		ipmi
+device		coretemp

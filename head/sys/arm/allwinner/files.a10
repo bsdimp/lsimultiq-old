@@ -1,0 +1,3 @@
+# $FreeBSD$
+
+arm/allwinner/aintc.c			standard
