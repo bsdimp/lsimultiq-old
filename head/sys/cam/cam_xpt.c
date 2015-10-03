@@ -536,7 +536,7 @@ xptdoioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flag, struct thread *
 			 * Map the pattern and match buffers into kernel
 			 * virtual address space.
 			 */
-			error = cam_periph_mapmem(inccb, &mapinfo);
+			error = cam_periph_mapmem(inccb, &mapinfo, MAXPHYS);
 
 			if (error) {
 				inccb->ccb_h.path = old_path;
@@ -2615,7 +2615,8 @@ xpt_action_default(union ccb *start_ccb)
 	case XPT_PATH_INQ:
 call_sim:
 		sim = path->bus->sim;
-		lock = ((sim->flags & CAM_SIM_NOLOCK) == 0) & (mtx_owned(sim->mtx) == 0);
+		lock = ((sim->flags & CAM_SIM_NEEDLOCK) != 0) &
+		    (mtx_owned(sim->mtx) == 0);
 		if (lock)
 			CAM_SIM_LOCK(sim);
 		(*(sim->sim_action))(sim, start_ccb);
@@ -3301,7 +3302,8 @@ xpt_run_devq(struct cam_devq *devq)
 		 * queued device, rather than the one from the calling bus.
 		 */
 		sim = device->sim;
-		lock = ((sim->flags & CAM_SIM_NOLOCK) == 0) & (mtx_owned(sim->mtx) == 0);
+		lock = ((sim->flags & CAM_SIM_NEEDLOCK) != 0) &
+		    (mtx_owned(sim->mtx) == 0);
 		if (lock)
 			CAM_SIM_LOCK(sim);
 		(*(sim->sim_action))(sim, work_ccb);
@@ -3924,8 +3926,8 @@ xpt_bus_register(struct cam_sim *sim, device_t parent, u_int32_t bus)
 		}
 	}
 
-	if (cpi.hba_misc & PIM_NOLOCK)
-		sim->flags |= CAM_SIM_NOLOCK;
+	if ((cpi.hba_misc & PIM_NOLOCK) == 0)
+		sim->flags |= CAM_SIM_NEEDLOCK;
 
 	/* Notify interested parties */
 	if (sim->path_id != CAM_XPT_PATH_ID) {
@@ -5211,6 +5213,11 @@ xpt_done_process(struct ccb_hdr *ccb_h)
 	if (ccb_h->status & CAM_RELEASE_SIMQ) {
 		xpt_release_simq(sim, /*run_queue*/FALSE);
 		ccb_h->status &= ~CAM_RELEASE_SIMQ;
+	}
+
+	if (ccb_h->status & CAM_RELEASE_RUN_SIMQ) {
+		xpt_release_simq(sim, /*run_queue*/TRUE);
+		ccb_h->status &= ~CAM_RELEASE_RUN_SIMQ;
 	}
 
 	if ((ccb_h->flags & CAM_DEV_QFRZDIS)

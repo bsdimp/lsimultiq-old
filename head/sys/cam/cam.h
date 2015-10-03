@@ -296,6 +296,9 @@ typedef enum {
 	/* Quality of service data is valid */
 	CAM_QOS_VALID		= 0x400,
 
+	/* SIM ready to take more commands */
+	CAM_RELEASE_RUN_SIMQ	= 0x800,
+
 	/* Mask bits for just the status # */
 	CAM_STATUS_MASK = 0x3F,
 

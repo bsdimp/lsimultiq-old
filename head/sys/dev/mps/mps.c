@@ -43,6 +43,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/selinfo.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
+#include <sys/rmlock.h>
 #include <sys/module.h>
 #include <sys/bus.h>
 #include <sys/conf.h>
@@ -134,7 +135,7 @@ typedef union _reply_descriptor {
 }reply_descriptor,address_descriptor;
 
 /* Rate limit chain-fail messages to 1 per minute */
-static struct timeval mps_chainfail_interval = { 60, 0 };
+struct timeval mps_chainfail_interval = { 60, 0 };
 
 /* 
  * sleep_flag can be either CAN_SLEEP or NO_SLEEP.
@@ -1042,13 +1043,11 @@ mps_enqueue_request(struct mps_softc *sc, struct mps_command *cm)
 	mps_dprint(sc, MPS_TRACE, "SMID %u cm %p ccb %p qnum %d\n",
 	    cm->cm_desc.Default.SMID, cm, cm->cm_ccb, q->qnum);
 
-	if (sc->mps_flags & MPS_FLAGS_ATTACH_DONE && !(sc->mps_flags & MPS_FLAGS_SHUTDOWN))
-		mtx_assert(&sc->mps_mtx, MA_OWNED);
-
 	cm->cm_desc.Default.MSIxIndex = q->qnum;
 	rd.u.low = cm->cm_desc.Words.Low;
 	rd.u.high = cm->cm_desc.Words.High;
 	rd.word = htole64(rd.word);
+
 	/* TODO-We may need to make below regwrite atomic */
 	mtx_lock_spin(&sc->hw_mtx);
 	mps_regwrite(sc, MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET,
@@ -1149,9 +1148,6 @@ mps_alloc_transaction_queues(struct mps_softc *sc)
 
 	for (qnum = 0; qnum < sc->numqueues; qnum++) {
 		q = malloc(sizeof(struct mps_queue), M_MPT2, M_WAITOK | M_ZERO);
-		snprintf(q->name, sizeof(q->name), "%sq%d\n",
-		    device_get_nameunit(sc->mps_dev), qnum);
-		mtx_init(&q->qmtx, q->name, NULL, MTX_DEF);
 		q->sc = sc;
 		q->qnum = qnum;
 		postqueues = (uint8_t *)sc->post_queues;
@@ -1160,8 +1156,8 @@ mps_alloc_transaction_queues(struct mps_softc *sc)
 		q->replypostindex = 0;
 		q->chainmem = malloc(sizeof(ck_ring_buffer_t) * sc->max_chains, M_MPSSAS, M_WAITOK);
 		ck_ring_init(&q->chain_ring, sc->max_chains);
-		q->ringmem = malloc(sizeof(ck_ring_buffer_t) * roundup2(sc->num_reqs, 2048), M_MPSSAS, M_WAITOK);
-		ck_ring_init(&q->req_ring, roundup2(sc->num_reqs, 2048));
+		q->ringmem = malloc(sizeof(ck_ring_buffer_t) * roundup2(sc->num_reqs, 4096), M_MPSSAS, M_WAITOK);
+		ck_ring_init(&q->req_ring, roundup2(sc->num_reqs, 4096));
 		sc->queues[qnum] = q;
 
 		/* XXX Need to pick a more precise value */
@@ -1199,7 +1195,6 @@ mps_free_transaction_queues(struct mps_softc *sc)
 		q = sc->queues[qnum];
 		if (q == NULL)
 			return;
-		mtx_destroy(&q->qmtx);
 		if (q->buffer_dmat != NULL)
 			bus_dma_tag_destroy(q->buffer_dmat);
 		sc->queues[qnum] = NULL;
@@ -1671,7 +1666,7 @@ mps_setup_sysctl(struct mps_softc *sc)
 
 	SYSCTL_ADD_PROC(sysctl_ctx, SYSCTL_CHILDREN(sysctl_tree),
 	    OID_AUTO, "chain_alloc_fail",
-	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+	    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
 	    sysctl_mps_chain_alloc_fail, "QU", "chain allocation failures");
 
 	SYSCTL_ADD_INT(sysctl_ctx, SYSCTL_CHILDREN(sysctl_tree),
@@ -1693,20 +1688,17 @@ sysctl_mps_io_cmds_active(SYSCTL_HANDLER_ARGS)
 {
 	struct mps_softc *sc;
 	struct mps_queue *q;
-	int qnum, num;
-	u_int x;
+	u_int qnum, num, val;
 
 	sc = (struct mps_softc *)arg1;
 	num = 0;
 	for (qnum = 0; qnum < MPS_MSIX_MAX; qnum++) {
 		if ((q = sc->queues[qnum]) != NULL) {
-			SYSCTL_OUT(req, &q->io_cmds_active,
-			    sizeof(q->io_cmds_active));
-			num += q->io_cmds_active;
-			x = ck_ring_size(&q->req_ring);
-			SYSCTL_OUT(req, &x, sizeof(x));
-			x = ck_ring_capacity(&q->req_ring);
-			SYSCTL_OUT(req, &x, sizeof(x));
+			val = ck_ring_size(&q->req_ring);
+			SYSCTL_OUT(req, &val, sizeof(val));
+			val = ck_ring_capacity(&q->req_ring);
+			SYSCTL_OUT(req, &val, sizeof(val));
+			num += val;
 		}
 	}
 
@@ -1738,15 +1730,15 @@ sysctl_mps_chain_free(SYSCTL_HANDLER_ARGS)
 {
 	struct mps_softc *sc;
 	struct mps_queue *q;
-	int qnum, num;
+	u_int qnum, num, val;
 
 	sc = (struct mps_softc *)arg1;
 	num = 0;
 	for (qnum = 0; qnum < MPS_MSIX_MAX; qnum++) {
 		if ((q = sc->queues[qnum]) != NULL) {
-			SYSCTL_OUT(req, &q->chain_free,
-			    sizeof(q->chain_free));
-			num += q->chain_free;
+			val = ck_ring_size(&q->chain_ring);
+			SYSCTL_OUT(req, &val, sizeof(val));
+			num += val;
 		}
 	}
 
@@ -1778,7 +1770,7 @@ sysctl_mps_chain_alloc_fail(SYSCTL_HANDLER_ARGS)
 {
 	struct mps_softc *sc;
 	struct mps_queue *q;
-	uint64_t num;
+	u_int num;
 	int qnum;
 
 	sc = (struct mps_softc *)arg1;
@@ -1803,7 +1795,7 @@ mps_attach(struct mps_softc *sc)
 
 	MPS_FUNCTRACE(sc);
 
-	snprintf(sc->mps_mtxname, sizeof(sc->mps_mtxname), "%slock",
+	snprintf(sc->mps_mtxname, sizeof(sc->mps_mtxname), "%smtx",
 	    device_get_nameunit(sc->mps_dev));
 	snprintf(sc->hw_mtxname, sizeof(sc->hw_mtxname), "%shw",
 	    device_get_nameunit(sc->mps_dev));
@@ -2152,7 +2144,6 @@ mps_intr_queue(void *data)
 	uint8_t flags;
 	u_int pq;
 
-	critical_enter();
 	q = (struct mps_queue *)data;
 	sc = q->sc;
 
@@ -2291,7 +2282,6 @@ mps_intr_queue(void *data)
 		mps_regwrite(sc, MPI2_REPLY_POST_HOST_INDEX_OFFSET, q->replypostindex | (q->qnum << 24));
 	}
 
-	critical_exit();
 	return;
 }
 
@@ -2761,13 +2751,10 @@ mps_data_cb(void *arg, bus_dma_segment_t *segs, int nsegs, int error)
 		error = mps_add_dmaseg(cm, segs[i].ds_addr, segs[i].ds_len,
 		    sflags, nsegs - i);
 		if (error != 0) {
-			/* Resource shortage, roll back! */
-			if (ratecheck(&sc->lastfail, &mps_chainfail_interval))
-				mps_dprint(sc, MPS_INFO, "Out of chain frames, "
-				    "consider increasing hw.mps.max_chains.\n");
-			cm->cm_flags |= MPS_CM_FLAGS_CHAIN_FAILED;
-			mps_complete_command(sc, cm);
-			return;
+			/* Resource shortage, can't roll back */
+			/* XXX Fix with new ck_ring */
+			if (1)
+				panic("mps: out of chain frames");
 		}
 	}
 
@@ -2827,21 +2814,18 @@ mps_wait_command(struct mps_softc *sc, struct mps_command *cm, int timeout,
     int sleep_flag)
 {
 	struct timeval cur_time, start_time;
-	int error, rc, lockedq, lockedsc;
+	int error, rc, lockedsc;
 
 	if (sc->mps_flags & MPS_FLAGS_DIAGRESET) 
 		return  EBUSY;
 
 	lockedsc = (mtx_owned(&sc->mps_mtx) ? 1 : 0);
-	lockedq = (mtx_owned(&cm->cm_q->qmtx) ? 1 : 0);
 
 	cm->cm_complete = NULL;
 	cm->cm_flags |= MPS_CM_FLAGS_POLLED;
 	error = mps_map_command(sc, cm);
 	if ((error != 0) && (error != EINPROGRESS))
 		return (error);
-	if (lockedq)
-		mps_qunlock(cm->cm_q);
 
 	/*
 	 * Check for context and wait for 50 mSec at a time until time has
@@ -2877,8 +2861,6 @@ mps_wait_command(struct mps_softc *sc, struct mps_command *cm, int timeout,
 		    "failed");
 		error = ETIMEDOUT;
 	}
-	if (lockedq)
-		mps_qlock(cm->cm_q);
 	return (error);
 }
 
@@ -2944,7 +2926,6 @@ mps_read_config_page(struct mps_softc *sc, struct mps_config_params *params)
 		error = mps_map_command(sc, cm);
 		return (error);
 	} else {
-		mps_qlock(cm->cm_q);
 		error = mps_wait_command(sc, cm, 0, CAN_SLEEP);
 		if (error) {
 			mps_dprint(sc, MPS_FAULT,
@@ -2952,7 +2933,6 @@ mps_read_config_page(struct mps_softc *sc, struct mps_config_params *params)
 			mps_free_command(sc, cm);
 			return (error);
 		}
-		mps_qunlock(cm->cm_q);
 		mps_config_complete(sc, cm);
 	}
 
@@ -2978,15 +2958,6 @@ mps_config_complete(struct mps_softc *sc, struct mps_command *cm)
 		bus_dmamap_sync(cm->cm_q->buffer_dmat, cm->cm_dmamap,
 		    BUS_DMASYNC_POSTREAD);
 		bus_dmamap_unload(cm->cm_q->buffer_dmat, cm->cm_dmamap);
-	}
-
-	/*
-	 * XXX KDM need to do more error recovery?  This results in the
-	 * device in question not getting probed.
-	 */
-	if ((cm->cm_flags & MPS_CM_FLAGS_ERROR_MASK) != 0) {
-		params->status = MPI2_IOCSTATUS_BUSY;
-		goto done;
 	}
 
 	reply = (MPI2_CONFIG_REPLY *)cm->cm_reply;

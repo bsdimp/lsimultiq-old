@@ -7,6 +7,9 @@ nooptions INVARIANTS
 nooptions INVARIANTS_SUPPORT
 nooptions DEADLKRES
 
+options		MAXPHYS=(4*1024*1024)
+options		DFLTPHYS=(4*1024*1024)
+
 #nooptions 	DDB_CTF
 #nooptions 	KDTRACE_FRAME
 #nooptions 	KDTRACE_HOOKS

@@ -51,6 +51,7 @@ struct mpssas_target {
 	uint16_t	handle;
 	uint16_t	encl_handle;
 	uint16_t	encl_slot;
+	u_int		frozen;
 	uint8_t		linkrate;
 	uint8_t		flags;
 #define MPSSAS_TARGET_INUNKNOWN		0x01
@@ -67,6 +68,7 @@ struct mpssas_target {
 	SLIST_HEAD(, mpssas_lun) luns;
 	struct mps_command *tm;
 	TAILQ_HEAD(, mps_command) timedout_commands;
+	struct mtx	tmtx;
 	uint16_t        exp_dev_handle;
 	uint16_t        phy_num;
 	uint16_t	parent_handle;
@@ -83,6 +85,7 @@ struct mpssas_target {
 	unsigned int    target_resets;
 	uint8_t		stop_at_shutdown;
 	uint8_t		supports_SSU;
+	char		mtxname[8];
 };
 
 struct mpssas_softc {
@@ -91,8 +94,8 @@ struct mpssas_softc {
 #define MPSSAS_IN_DISCOVERY	(1 << 0)
 #define MPSSAS_IN_STARTUP	(1 << 1)
 #define MPSSAS_DISCOVERY_TIMEOUT_PENDING	(1 << 2)
-#define MPSSAS_QUEUE_FROZEN	(1 << 3)
 #define	MPSSAS_SHUTDOWN		(1 << 4)
+	u_int			qfrozen;
 	u_int			maxtargets;
 	struct mpssas_target	*targets;
 	struct cam_devq		*devq;
@@ -164,14 +167,9 @@ do {					\
 	(req)->LUN[1] = lun;		\
 } while(0)
 
-#define MPSSAS_RLOCK(sassc)
-#define MPSSAS_RUNLOCK(sassc)
-#define MPSSAS_WLOCK(sassc)
-#define MPSSAS_RUNLOCK(sassc)
-#define MPSSAS_WUPGRADE(sassc)
-#define MPSSAS_WDOWNGRADE(sassc)
-#define MPSSAS_RASSERT(sassc)
-#define MPSSAS_WASSERT(sassc)
+#define mpssas_lock_target(t)		mtx_lock(&(t)->tmtx)
+#define mpssas_unlock_target(t)		mtx_unlock(&(t)->tmtx)
+#define mpssas_trylock_target(t)	mtx_trylock(&(t)->tmtx)
 
 void mpssas_rescan_target(struct mps_softc *sc, struct mpssas_target *targ);
 void mpssas_discovery_end(struct mpssas_softc *sassc);

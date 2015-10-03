@@ -42,6 +42,9 @@ __FBSDID("$FreeBSD$");
 #include <sys/kernel.h>
 #include <sys/selinfo.h>
 #include <sys/module.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
+#include <sys/rmlock.h>
 #include <sys/bus.h>
 #include <sys/conf.h>
 #include <sys/bio.h>
@@ -196,8 +199,9 @@ mpssas_startup_increment(struct mpssas_softc *sassc)
 void
 mpssas_release_simq_reinit(struct mpssas_softc *sassc)
 {
-	if (sassc->flags & MPSSAS_QUEUE_FROZEN) {
-		sassc->flags &= ~MPSSAS_QUEUE_FROZEN;
+	/* XXX Locking */
+	if (sassc->qfrozen != 0) {
+		sassc->qfrozen = 0;
 		xpt_release_simq(sassc->sim, 1);
 		mps_dprint(sassc->sc, MPS_INFO, "Unfreezing SIM queue\n");
 	}
@@ -253,7 +257,8 @@ mpssas_free_tm(struct mps_softc *sc, struct mps_command *tm)
 	 * INRESET flag as well or scsi I/O will not work.
 	 */
 	if (tm->cm_targ != NULL) {
-		tm->cm_targ->flags &= ~MPSSAS_TARGET_INRESET;
+		tm->cm_targ->flags &= ~MPSSAS_TARGET_INRECOVERY;
+		tm->cm_targ->frozen = 0;
 	}
 	if (tm->cm_ccb) {
 		mps_dprint(sc, MPS_INFO, "Unfreezing devq for target ID %d\n",
@@ -450,6 +455,7 @@ mpssas_prepare_volume_remove(struct mpssas_softc *sassc, uint16_t handle)
 	}
 
 	targ->flags |= MPSSAS_TARGET_INREMOVAL;
+	targ->frozen = 1;
 
 	cm = mpssas_alloc_tm(sc);
 	if (cm == NULL) {
@@ -512,7 +518,11 @@ mpssas_prepare_remove(struct mpssas_softc *sassc, uint16_t handle)
 		return;
 	}
 
+	mps_dprint(sc, MPS_RECOVERY,
+	    "Preparing to remove handle 0x%x targ %p\n", handle, targ);
+
 	targ->flags |= MPSSAS_TARGET_INREMOVAL;
+	targ->frozen = 1;
 
 	cm = mpssas_alloc_tm(sc);
 	if (cm == NULL) {
@@ -559,20 +569,6 @@ mpssas_remove_device(struct mps_softc *sc, struct mps_command *tm)
 	reply = (MPI2_SCSI_TASK_MANAGE_REPLY *)tm->cm_reply;
 	handle = (uint16_t)(uintptr_t)tm->cm_complete_data;
 	targ = tm->cm_targ;
-
-	/*
-	 * Currently there should be no way we can hit this case.  It only
-	 * happens when we have a failure to allocate chain frames, and
-	 * task management commands don't have S/G lists.
-	 */
-	if ((tm->cm_flags & MPS_CM_FLAGS_ERROR_MASK) != 0) {
-		mps_dprint(sc, MPS_ERROR,
-		    "%s: cm_flags = %#x for remove of handle %#04x! "
-		    "This should not happen!\n", __func__, tm->cm_flags,
-		    handle);
-		mpssas_free_tm(sc, tm);
-		return;
-	}
 
 	if (reply == NULL) {
 		/* XXX retry the remove after the diag reset completes? */
@@ -637,20 +633,6 @@ mpssas_remove_complete(struct mps_softc *sc, struct mps_command *tm)
 
 	reply = (MPI2_SAS_IOUNIT_CONTROL_REPLY *)tm->cm_reply;
 	handle = (uint16_t)(uintptr_t)tm->cm_complete_data;
-
-	/*
-	 * Currently there should be no way we can hit this case.  It only
-	 * happens when we have a failure to allocate chain frames, and
-	 * task management commands don't have S/G lists.
-	 */
-	if ((tm->cm_flags & MPS_CM_FLAGS_ERROR_MASK) != 0) {
-		mps_dprint(sc, MPS_XINFO,
-			   "%s: cm_flags = %#x for remove of handle %#04x! "
-			   "This should not happen!\n", __func__, tm->cm_flags,
-			   handle);
-		mpssas_free_tm(sc, tm);
-		return;
-	}
 
 	if (reply == NULL) {
 		/* most likely a chip reset */
@@ -721,8 +703,9 @@ int
 mps_attach_sas(struct mps_softc *sc)
 {
 	struct mpssas_softc *sassc;
+	struct mpssas_target *targ;
 	cam_status status;
-	int unit, error = 0;
+	int i, unit, error = 0;
 
 	MPS_FUNCTRACE(sc);
 
@@ -750,6 +733,12 @@ mps_attach_sas(struct mps_softc *sc)
 	}
 	sc->sassc = sassc;
 	sassc->sc = sc;
+	for (i = 0; i < sassc->maxtargets; i++) {
+		targ = &sassc->targets[i];
+		snprintf(targ->mtxname, sizeof(targ->mtxname), "%st%d",
+		    device_get_nameunit(sc->mps_dev), i);
+		mtx_init(&targ->tmtx, targ->mtxname, NULL, MTX_DEF);
+	}
 
 	if ((sassc->devq = cam_simq_alloc(sc->num_reqs)) == NULL) {
 		mps_dprint(sc, MPS_ERROR, "Cannot allocate SIMQ\n");
@@ -964,7 +953,7 @@ mpssas_action(struct cam_sim *sim, union ccb *ccb)
 		/*
 		 * XXX KDM where does this number come from?
 		 */
-		cpi->maxio = 256 * 1024;
+		cpi->maxio = MAXPHYS;
 #endif
 		mpssas_set_ccbstatus(ccb, CAM_REQ_CMP);
 		break;
@@ -1105,14 +1094,6 @@ mpssas_complete_all_commands(struct mps_softc *sc)
 			completed = 1;
 		}
 
-		if (q->io_cmds_active != 0) {
-			q->io_cmds_active--;
-		} else {
-			mps_dprint(cm->cm_sc, MPS_INFO, "Warning: "
-			    "io_cmds_active is out of sync - resynching to "
-			    "0\n");
-		}
-		
 		if ((completed == 0) && (cm->cm_state != MPS_CM_STATE_FREE)) {
 			/* this should never happen, but if it does, log */
 			mpssas_log_command(cm, MPS_RECOVERY,
@@ -1121,6 +1102,11 @@ mpssas_complete_all_commands(struct mps_softc *sc)
 			    cm->cm_ccb);
 		}
 	}
+
+	/*
+	 * XXX Should we check all of the queues to see if their size is zero?
+	 * What about commands that are going through a wakeup?
+	 */
 }
 
 void
@@ -1157,13 +1143,17 @@ mpssas_handle_reinit(struct mps_softc *sc)
 	 * handles.  
 	 */
 	for (i = 0; i < sc->sassc->maxtargets; i++) {
-		if (sc->sassc->targets[i].outstanding != 0)
+		struct mpssas_target *targ;
+
+		targ = &sc->sassc->targets[i];
+		if (targ->outstanding != 0)
 			mps_dprint(sc, MPS_INIT, "target %u outstanding %u\n", 
-			    i, sc->sassc->targets[i].outstanding);
-		sc->sassc->targets[i].handle = 0x0;
-		sc->sassc->targets[i].exp_dev_handle = 0x0;
-		sc->sassc->targets[i].outstanding = 0;
-		sc->sassc->targets[i].flags = MPSSAS_TARGET_INDIAGRESET;
+			    i, targ->outstanding);
+		targ->handle = 0x0;
+		targ->exp_dev_handle = 0x0;
+		targ->outstanding = 0;
+		targ->flags = MPSSAS_TARGET_INDIAGRESET;
+		targ->frozen = 1;
 	}
 }
 
@@ -1195,19 +1185,6 @@ mpssas_logical_unit_reset_complete(struct mps_softc *sc, struct mps_command *tm)
 	req = (MPI2_SCSI_TASK_MANAGE_REQUEST *)tm->cm_req;
 	reply = (MPI2_SCSI_TASK_MANAGE_REPLY *)tm->cm_reply;
 	targ = tm->cm_targ;
-
-	/*
-	 * Currently there should be no way we can hit this case.  It only
-	 * happens when we have a failure to allocate chain frames, and
-	 * task management commands don't have S/G lists.
-	 * XXXSL So should it be an assertion?
-	 */
-	if ((tm->cm_flags & MPS_CM_FLAGS_ERROR_MASK) != 0) {
-		mps_dprint(sc, MPS_ERROR, "%s: cm_flags = %#x for LUN reset! "
-			   "This should not happen!\n", __func__, tm->cm_flags);
-		mpssas_free_tm(sc, tm);
-		return;
-	}
 
 	if (reply == NULL) {
 		mpssas_log_command(tm, MPS_RECOVERY,
@@ -1284,18 +1261,6 @@ mpssas_target_reset_complete(struct mps_softc *sc, struct mps_command *tm)
 	req = (MPI2_SCSI_TASK_MANAGE_REQUEST *)tm->cm_req;
 	reply = (MPI2_SCSI_TASK_MANAGE_REPLY *)tm->cm_reply;
 	targ = tm->cm_targ;
-
-	/*
-	 * Currently there should be no way we can hit this case.  It only
-	 * happens when we have a failure to allocate chain frames, and
-	 * task management commands don't have S/G lists.
-	 */
-	if ((tm->cm_flags & MPS_CM_FLAGS_ERROR_MASK) != 0) {
-		mps_dprint(sc, MPS_ERROR,"%s: cm_flags = %#x for target reset! "
-			   "This should not happen!\n", __func__, tm->cm_flags);
-		mpssas_free_tm(sc, tm);
-		return;
-	}
 
 	if (reply == NULL) {
 		mpssas_log_command(tm, MPS_RECOVERY,
@@ -1417,19 +1382,6 @@ mpssas_abort_complete(struct mps_softc *sc, struct mps_command *tm)
 	req = (MPI2_SCSI_TASK_MANAGE_REQUEST *)tm->cm_req;
 	reply = (MPI2_SCSI_TASK_MANAGE_REPLY *)tm->cm_reply;
 	targ = tm->cm_targ;
-
-	/*
-	 * Currently there should be no way we can hit this case.  It only
-	 * happens when we have a failure to allocate chain frames, and
-	 * task management commands don't have S/G lists.
-	 */
-	if ((tm->cm_flags & MPS_CM_FLAGS_ERROR_MASK) != 0) {
-		mpssas_log_command(tm, MPS_RECOVERY,
-		    "cm_flags = %#x for abort %p TaskMID %u!\n", 
-		    tm->cm_flags, tm, le16toh(req->TaskMID));
-		mpssas_free_tm(sc, tm);
-		return;
-	}
 
 	if (reply == NULL) {
 		mpssas_log_command(tm, MPS_RECOVERY,
@@ -1566,7 +1518,7 @@ mpssas_start_recovery(struct mps_softc *sc, struct mpssas_target *targ,
 			qcm = &sc->commands[i];
 			if ((qcm->cm_state == MPS_CM_STATE_BUSY_CCB) &&
 			    (qcm->cm_targ == targ))
-				targ->outstanding++;
+				atomic_add_int(&targ->outstanding, 1);
 		}
 
 		if ((targ->tm = mpssas_alloc_tm(sc)) == NULL) {
@@ -1586,6 +1538,7 @@ mpssas_start_recovery(struct mps_softc *sc, struct mpssas_target *targ,
 			return (0);
 		}
 		targ->flags = MPSSAS_TARGET_INUNKNOWN;
+		targ->frozen = 1;
 		mps_dprint(sc, MPS_RECOVERY, "recovery cm %p allocated tm %p\n",
 		    cm, targ->tm);
 	}
@@ -1631,7 +1584,10 @@ mpssas_scsiio_timeout(void *data)
 	 * and been re-used, though this is unlikely.
 	 */
 	/* XXX Try running all queues? */
+	/* XXX Locking... ugh */
+	mps_unlock(sc);
 	mps_intr_queue(cm->cm_q);
+	mps_lock(sc);
 	if (cm->cm_state == MPS_CM_STATE_FREE) {
 		mpssas_log_command(cm, MPS_XINFO,
 		    "SCSI command %p almost timed out\n", cm);
@@ -1681,22 +1637,6 @@ mpssas_action_scsiio(struct mpssas_softc *sassc, union ccb *ccb)
 	KASSERT(csio->ccb_h.target_id < sassc->maxtargets,
 	    ("Target %d out of bounds in XPT_SCSI_IO\n",
 	     csio->ccb_h.target_id));
-	targ = &sassc->targets[csio->ccb_h.target_id];
-	mps_dprint(sc, MPS_TRACE, "ccb %p target flag %x\n", ccb, targ->flags);
-	if (targ->handle == 0x0) {
-		mps_dprint(sc, MPS_ERROR, "%s NULL handle for target %u\n", 
-		    __func__, csio->ccb_h.target_id);
-		mpssas_set_ccbstatus(ccb, CAM_DEV_NOT_THERE);
-		xpt_done(ccb);
-		return;
-	}
-	if (targ->flags & MPS_TARGET_FLAGS_RAID_COMPONENT) {
-		mps_dprint(sc, MPS_ERROR, "%s Raid component no SCSI IO "
-		    "supported %u\n", __func__, csio->ccb_h.target_id);
-		mpssas_set_ccbstatus(ccb, CAM_DEV_NOT_THERE);
-		xpt_done(ccb);
-		return;
-	}
 	/*
 	 * Sometimes, it is possible to get a command that is not "In
 	 * Progress" and was actually aborted by the upper layer.  Check for
@@ -1708,60 +1648,110 @@ mpssas_action_scsiio(struct mpssas_softc *sassc, union ccb *ccb)
 		xpt_done(ccb);
 		return;
 	}
-	/*
-	 * If devinfo is 0 this will be a volume.  In that case don't tell CAM
-	 * that the volume has timed out.  We want volumes to be enumerated
-	 * until they are deleted/removed, not just failed.
-	 */
-	if (targ->flags & MPSSAS_TARGET_INREMOVAL) {
-		if (targ->devinfo == 0)
-			mpssas_set_ccbstatus(ccb, CAM_REQ_CMP);
-		else
-			mpssas_set_ccbstatus(ccb, CAM_SEL_TIMEOUT);
-		xpt_done(ccb);
-		return;
-	}
 
-	if ((sc->mps_flags & MPS_FLAGS_SHUTDOWN) != 0) {
-		mps_dprint(sc, MPS_INFO, "%s shutting down\n", __func__);
+	targ = &sassc->targets[csio->ccb_h.target_id];
+	mps_dprint(sc, MPS_TRACE, "ccb %p target flag %x\n", ccb, targ->flags);
+	if (targ->handle == 0x0) {
+		mps_dprint(sc, MPS_ERROR, "%s NULL handle for target %u\n", 
+		    __func__, csio->ccb_h.target_id);
 		mpssas_set_ccbstatus(ccb, CAM_DEV_NOT_THERE);
 		xpt_done(ccb);
 		return;
 	}
 
-	/*
-	 * If target has a reset in progress, freeze the devq and return.  The
-	 * devq will be released when the TM reset is finished.
-	 */
-	if (targ->flags & MPSSAS_TARGET_INRESET) {
-		ccb->ccb_h.status = CAM_BUSY | CAM_DEV_QFRZN;
-		mps_dprint(sc, MPS_INFO, "%s: Freezing devq for target ID %d\n",
-		    __func__, targ->tid);
-		xpt_freeze_devq(ccb->ccb_h.path, 1);
+	/* XXX Locking... needs more thought. */
+	if (targ->flags & MPS_TARGET_FLAGS_RAID_COMPONENT) {
+		mps_dprint(sc, MPS_ERROR, "%s Raid component no SCSI IO "
+		    "supported %u\n", __func__, csio->ccb_h.target_id);
+		mpssas_set_ccbstatus(ccb, CAM_DEV_NOT_THERE);
 		xpt_done(ccb);
 		return;
 	}
+	/*
+	 * If devinfo is 0 this will be a volume.  In that case don't tell CAM
+	 * that the volume has timed out.  We want volumes to be enumerated
+	 * until they are deleted/removed, not just failed.
+	 *
+	 * If target has a reset in progress, freeze the devq and return.  The
+	 * devq will be released when the TM reset is finished.
+	 *
+	 */
+	if ((targ->frozen != 0) && mpssas_trylock_target(targ)) {
+		if (targ->frozen != 0) {
+			if (targ->flags & MPSSAS_TARGET_INREMOVAL) {
+				if (targ->devinfo == 0)
+					mpssas_set_ccbstatus(ccb, CAM_REQ_CMP);
+				else
+					mpssas_set_ccbstatus(ccb, CAM_SEL_TIMEOUT);
+				mpssas_unlock_target(targ);
+				xpt_done(ccb);
+				return;
+			}
+			if (targ->flags & MPSSAS_TARGET_INRESET) {
+				ccb->ccb_h.status = CAM_BUSY | CAM_DEV_QFRZN;
+				mps_dprint(sc, MPS_INFO,
+				    "%s: Freezing devq for target ID %d\n",
+				    __func__, targ->tid);
+				xpt_freeze_devq(ccb->ccb_h.path, 1);
+				mpssas_unlock_target(targ);
+				xpt_done(ccb);
+				return;
+			}
+		}
+		mpssas_unlock_target(targ);
+	}
 
+	if ((sassc->qfrozen != 0) && mps_trylock(sc)) {
+		if (sassc->qfrozen != 0) {
+			if ((sc->mps_flags & MPS_FLAGS_SHUTDOWN) != 0) {
+				mps_dprint(sc, MPS_INFO,
+				    "%s shutting down\n", __func__);
+				mpssas_set_ccbstatus(ccb, CAM_DEV_NOT_THERE);
+				mps_unlock(sc);
+				xpt_done(ccb);
+				return;
+			}
+			if ((sc->mps_flags & MPS_FLAGS_DIAGRESET) != 0) {
+				ccb->ccb_h.status &= ~CAM_SIM_QUEUED;
+				ccb->ccb_h.status |= CAM_REQUEUE_REQ;
+				mps_unlock(sc);
+				xpt_done(ccb);
+				return;
+			}
+		}
+		mps_unlock(sc);
+	}
+
+	/* Need to do this here to avoid a failure later on. */
 	if (MPS_SET_LUN(newlun, csio->ccb_h.target_lun) != 0) {
 		mpssas_set_ccbstatus(ccb, CAM_LUN_INVALID);
 		xpt_done(ccb);
 		return;
 	}
 
-	/* XXX Locking.  Order here is important */
+	/*
+	 * Order here is important.  Due to the nature of the allocator,
+	 * once we have allocated a command, it cannot be freed from
+	 * this context.
+	 *
+	 * The critical section is needed because we're doing a pre-check
+	 * on how many chain frames are available, and we don't want to be
+	 * preempted and have the assurance become stale.
+	 */
 	critical_enter();
-	if (((sc->mps_flags & MPS_FLAGS_DIAGRESET) != 0) ||
-	   ((cm = mps_alloc_command(sc)) == NULL)) {
+	if ((cm = mps_alloc_command_size(sc, ccb->csio.dxfer_len)) == NULL) {
+		/* Now we're out of the fast path, take the lock. */
+		critical_exit();
 		mps_lock(sc);
-		if ((sassc->flags & MPSSAS_QUEUE_FROZEN) == 0) {
+		if (sassc->qfrozen == 0) {
 			xpt_freeze_simq(sassc->sim, 1);
-			sassc->flags |= MPSSAS_QUEUE_FROZEN;
+			sassc->qfrozen = 1;
+			mps_dprint(sc, MPS_XINFO, "Freezing SIM queue\n");
 		}
 		mps_unlock(sc);
 		ccb->ccb_h.status &= ~CAM_SIM_QUEUED;
 		ccb->ccb_h.status |= CAM_REQUEUE_REQ;
 		xpt_done(ccb);
-		critical_exit();
 		return;
 	}
 
@@ -1921,9 +1911,8 @@ mpssas_action_scsiio(struct mpssas_softc *sassc, union ccb *ccb)
 	    mpssas_scsiio_timeout, cm, cm->cm_q->qnum, 0);
 
 
-	/* XXX Locking */
 	if (targ->flags & MPSSAS_TARGET_INRECOVERY)
-		targ->outstanding++;
+		atomic_add_int(&targ->outstanding, 1);
 	ccb->ccb_h.status |= CAM_SIM_QUEUED;
 	cm->cm_state = MPS_CM_STATE_BUSY_CCB;
 
@@ -2103,20 +2092,20 @@ mps_sc_failed_io_info(struct mps_softc *sc, struct ccb_scsiio *csio,
 	if (scsi_state & MPI2_SCSI_STATE_AUTOSENSE_VALID)
 		strcat(desc_scsi_state, "autosense valid ");
 
-	mps_dprint(sc, MPS_INFO, "\thandle(0x%04x), ioc_status(%s)(0x%04x)\n",
+	mps_dprint(sc, MPS_XINFO, "\thandle(0x%04x), ioc_status(%s)(0x%04x)\n",
 	    le16toh(mpi_reply->DevHandle), desc_ioc_state, ioc_status);
 	/* We can add more detail about underflow data here
 	 * TO-DO
 	 * */
-	mps_dprint(sc, MPS_INFO, "\tscsi_status(%s)(0x%02x), "
+	mps_dprint(sc, MPS_XINFO, "\tscsi_status(%s)(0x%02x), "
 	    "scsi_state(%s)(0x%02x)\n", desc_scsi_status, scsi_status,
 	    desc_scsi_state, scsi_state);
 
-	if (sc->mps_debug & MPS_INFO &&
+	if (sc->mps_debug & MPS_XINFO &&
 		scsi_state & MPI2_SCSI_STATE_AUTOSENSE_VALID) {
-		mps_dprint(sc, MPS_INFO, "-> Sense Buffer Data : Start :\n");
+		mps_dprint(sc, MPS_XINFO, "-> Sense Buffer Data : Start :\n");
 		scsi_sense_print(csio);
-		mps_dprint(sc, MPS_INFO, "-> Sense Buffer Data : End :\n");
+		mps_dprint(sc, MPS_XINFO, "-> Sense Buffer Data : End :\n");
 	}
 
 	if (scsi_state & MPI2_SCSI_STATE_RESPONSE_INFO_VALID) {
@@ -2133,11 +2122,11 @@ mpssas_scsiio_complete(struct mps_softc *sc, struct mps_command *cm)
 	union ccb *ccb;
 	struct ccb_scsiio *csio;
 	struct mpssas_softc *sassc;
+	struct mpssas_target *target;
 	struct scsi_vpd_supported_page_list *vpd_list = NULL;
 	u8 *TLR_bits, TLR_on;
 	int dir = 0, i;
 	u16 alloc_len;
-	struct mpssas_target *target;
 	target_id_t target_id;
 
 	MPS_FUNCTRACE(sc);
@@ -2146,13 +2135,17 @@ mpssas_scsiio_complete(struct mps_softc *sc, struct mps_command *cm)
 	    cm->cm_desc.Default.SMID, cm->cm_ccb, cm->cm_reply,
 	    cm->cm_targ->outstanding);
 
+	/* XXX Locking This is a race */
 	callout_stop(&cm->cm_callout);
 
 	sassc = sc->sassc;
 	ccb = cm->cm_complete_data;
 	csio = &ccb->csio;
 	target_id = csio->ccb_h.target_id;
+	target = cm->cm_targ;
 	rep = (MPI2_SCSI_IO_REPLY *)cm->cm_reply;
+
+	KASSERT((target == &sassc->targets[target_id]), "Target object mismatch\n");
 	/*
 	 * XXX KDM if the chain allocation fails, does it matter if we do
 	 * the sync and unload here?  It is simpler to do it in every case,
@@ -2167,10 +2160,9 @@ mpssas_scsiio_complete(struct mps_softc *sc, struct mps_command *cm)
 		bus_dmamap_unload(cm->cm_q->buffer_dmat, cm->cm_dmamap);
 	}
 
-	/* XXX Locking? */
-	target = &sassc->targets[target_id];
+	/* XXX Locking... */
 	if (target->flags & MPSSAS_TARGET_INRECOVERY)
-		cm->cm_targ->outstanding--;
+		atomic_add_int(&cm->cm_targ->outstanding, -1);
 	ccb->ccb_h.status &= ~(CAM_STATUS_MASK | CAM_SIM_QUEUED);
 	cm->cm_state = MPS_CM_STATE_BUSY;
 
@@ -2180,8 +2172,8 @@ mpssas_scsiio_complete(struct mps_softc *sc, struct mps_command *cm)
 			mpssas_log_command(cm, MPS_RECOVERY,
 			    "completed timedout cm %p ccb %p during recovery "
 			    "ioc %x scsi %x state %x xfer %u\n",
-			    cm, cm->cm_ccb,
-			    le16toh(rep->IOCStatus), rep->SCSIStatus, rep->SCSIState,
+			    cm, cm->cm_ccb, le16toh(rep->IOCStatus),
+			    rep->SCSIStatus, rep->SCSIState,
 			    le32toh(rep->TransferCount));
 		else
 			mpssas_log_command(cm, MPS_RECOVERY,
@@ -2192,8 +2184,8 @@ mpssas_scsiio_complete(struct mps_softc *sc, struct mps_command *cm)
 			mpssas_log_command(cm, MPS_RECOVERY,
 			    "completed cm %p ccb %p during recovery "
 			    "ioc %x scsi %x state %x xfer %u\n",
-			    cm, cm->cm_ccb,
-			    le16toh(rep->IOCStatus), rep->SCSIStatus, rep->SCSIState,
+			    cm, cm->cm_ccb, le16toh(rep->IOCStatus),
+			    rep->SCSIStatus, rep->SCSIState,
 			    le32toh(rep->TransferCount));
 		else
 			mpssas_log_command(cm, MPS_RECOVERY,
@@ -2203,38 +2195,6 @@ mpssas_scsiio_complete(struct mps_softc *sc, struct mps_command *cm)
 		mpssas_log_command(cm, MPS_RECOVERY,
 		    "reset completed cm %p ccb %p\n",
 		    cm, cm->cm_ccb);
-	}
-
-	if ((cm->cm_flags & MPS_CM_FLAGS_ERROR_MASK) != 0) {
-		/*
-		 * We ran into an error after we tried to map the command,
-		 * so we're getting a callback without queueing the command
-		 * to the hardware.  So we set the status here, and it will
-		 * be retained below.  We'll go through the "fast path",
-		 * because there can be no reply when we haven't actually
-		 * gone out to the hardware.
-		 */
-		mpssas_set_ccbstatus(ccb, CAM_REQUEUE_REQ);
-
-		/*
-		 * Currently the only error included in the mask is
-		 * MPS_CM_FLAGS_CHAIN_FAILED, which means we're out of
-		 * chain frames.  We need to freeze the queue until we get
-		 * a command that completed without this error, which will
-		 * hopefully have some chain frames attached that we can
-		 * use.  If we wanted to get smarter about it, we would
-		 * only unfreeze the queue in this condition when we're
-		 * sure that we're getting some chain frames back.  That's
-		 * probably unnecessary.
-		 */
-		mps_lock(sc);
-		if ((sassc->flags & MPSSAS_QUEUE_FROZEN) == 0) {
-			xpt_freeze_simq(sassc->sim, 1);
-			sassc->flags |= MPSSAS_QUEUE_FROZEN;
-			mps_dprint(sc, MPS_XINFO, "Error sending command, "
-				   "freezing SIM queue\n");
-		}
-		mps_unlock(sc);
 	}
 
 	/*
@@ -2251,6 +2211,7 @@ mpssas_scsiio_complete(struct mps_softc *sc, struct mps_command *cm)
 
 	/* Take the fast path to completion */
 	if (cm->cm_reply == NULL) {
+		mps_free_command(sc, cm);
 		if (mpssas_get_ccbstatus(ccb) == CAM_REQ_INPROG) {
 			if ((sc->mps_flags & MPS_FLAGS_DIAGRESET) != 0)
 				mpssas_set_ccbstatus(ccb, CAM_SCSI_BUS_RESET);
@@ -2258,21 +2219,29 @@ mpssas_scsiio_complete(struct mps_softc *sc, struct mps_command *cm)
 				mpssas_set_ccbstatus(ccb, CAM_REQ_CMP);
 				ccb->csio.scsi_status = SCSI_STATUS_OK;
 			}
-			/* XXX LOCKING */
-			mps_lock(sc);
-			if (sassc->flags & MPSSAS_QUEUE_FROZEN) {
-				ccb->ccb_h.status |= CAM_RELEASE_SIMQ;
-				sassc->flags &= ~MPSSAS_QUEUE_FROZEN;
-				mps_dprint(sc, MPS_XINFO,
-				    "Unfreezing SIM queue\n");
+			/*
+			 * If the trylock operation is unsuccessful then we can
+			 * assume that another thread is already examining
+			 * sassc->qfrozen and will either clear it or will
+			 * find that it's already clear.  There is a small
+			 * possibility of a race where the losing thread will
+			 * not signal to release the SIMQ, but the winning
+			 * thread will so that's ok.
+			 */
+			if ((sassc->qfrozen != 0) && mps_trylock(sc)) {
+				if (sassc->qfrozen != 0) {
+					/* XXX May want RELEASE_RUN */
+					ccb->ccb_h.status |= CAM_RELEASE_SIMQ;
+					sassc->qfrozen = 0;
+					mps_dprint(sc, MPS_XINFO,
+					    "Unfreezing SIM queue\n");
+				}
+				mps_unlock(sc);
 			}
-			mps_unlock(sc);
 		} 
 
 		/*
-		 * There are two scenarios where the status won't be
-		 * CAM_REQ_CMP.  The first is if MPS_CM_FLAGS_ERROR_MASK is
-		 * set, the second is in the MPS_FLAGS_DIAGRESET above.
+		 * This only happens because of the MPS_FLAGS_DIAGRESET case.
 		 */
 		if (mpssas_get_ccbstatus(ccb) != CAM_REQ_CMP) {
 			/*
@@ -2281,16 +2250,13 @@ mpssas_scsiio_complete(struct mps_softc *sc, struct mps_command *cm)
 			 * recovery.
 			 */
 			ccb->ccb_h.status |= CAM_DEV_QFRZN;
-			mps_lock(sc);
 			xpt_freeze_devq(ccb->ccb_h.path, /*count*/ 1);
-			mps_unlock(sc);
 		}
-		mps_free_command(sc, cm);
-		xpt_done_direct(ccb);
+		xpt_done(ccb);
 		return;
 	}
 
-	mpssas_log_command(cm, MPS_INFO,
+	mpssas_log_command(cm, MPS_XINFO,
 	    "ioc %x scsi %x state %x xfer %u\n",
 	    le16toh(rep->IOCStatus), rep->SCSIStatus, rep->SCSIState,
 	    le32toh(rep->TransferCount));
@@ -2300,10 +2266,11 @@ mpssas_scsiio_complete(struct mps_softc *sc, struct mps_command *cm)
 	 * Volume if an error occurred (normal I/O retry).  Use the original
 	 * CCB, but set a flag that this will be a retry so that it's sent to
 	 * the original volume.  Free the command but reuse the CCB.
-	 * XXX LOCKING needs more review
 	 */
 	if (cm->cm_flags & MPS_CM_FLAGS_DD_IO) {
+		mps_lock(sc);
 		mps_free_command(sc, cm);
+		mps_unlock(sc);
 		ccb->ccb_h.sim_priv.entries[0].field = MPS_WD_RETRY;
 		mpssas_action_scsiio(sassc, ccb);
 		return;
@@ -2510,21 +2477,26 @@ mpssas_scsiio_complete(struct mps_softc *sc, struct mps_command *cm)
 	
 	mps_sc_failed_io_info(sc,csio,rep);
 
+	/*
+	 * The lock is required because a reply frame needs to be
+	 * freed to the global queue.
+	 */
 	mps_lock(sc);
-	if (sassc->flags & MPSSAS_QUEUE_FROZEN) {
+	mps_free_command(sc, cm);
+	if (sassc->qfrozen != 0) {
+		/* XXX May want RELEASE_RUN */
 		ccb->ccb_h.status |= CAM_RELEASE_SIMQ;
-		sassc->flags &= ~MPSSAS_QUEUE_FROZEN;
+		sassc->qfrozen = 0;
 		mps_dprint(sc, MPS_XINFO, "Command completed, "
 		    "unfreezing SIM queue\n");
 	}
+	mps_unlock(sc);
 
 	if (mpssas_get_ccbstatus(ccb) != CAM_REQ_CMP) {
 		ccb->ccb_h.status |= CAM_DEV_QFRZN;
 		xpt_freeze_devq(ccb->ccb_h.path, /*count*/ 1);
 	}
-	mps_unlock(sc);
 
-	mps_free_command(sc, cm);
 	xpt_done(ccb);
 }
 
@@ -2807,19 +2779,6 @@ mpssas_smpio_complete(struct mps_softc *sc, struct mps_command *cm)
 	union ccb *ccb;
 
 	ccb = cm->cm_complete_data;
-
-	/*
-	 * Currently there should be no way we can hit this case.  It only
-	 * happens when we have a failure to allocate chain frames, and SMP
-	 * commands require two S/G elements only.  That should be handled
-	 * in the standard request size.
-	 */
-	if ((cm->cm_flags & MPS_CM_FLAGS_ERROR_MASK) != 0) {
-		mps_dprint(sc, MPS_ERROR,"%s: cm_flags = %#x on SMP request!\n",
-			   __func__, cm->cm_flags);
-		mpssas_set_ccbstatus(ccb, CAM_REQ_CMP_ERR);
-		goto bailout;
-        }
 
 	rpl = (MPI2_SMP_PASSTHROUGH_REPLY *)cm->cm_reply;
 	if (rpl == NULL) {
@@ -3211,6 +3170,7 @@ mpssas_action_resetdev(struct mpssas_softc *sassc, union ccb *ccb)
 	tm->cm_complete_data = ccb;
 	tm->cm_targ = targ;
 	targ->flags |= MPSSAS_TARGET_INRESET;
+	targ->frozen = 1;
 
 	mps_map_command(sc, tm);
 }
@@ -3227,24 +3187,6 @@ mpssas_resetdev_complete(struct mps_softc *sc, struct mps_command *tm)
 	resp = (MPI2_SCSI_TASK_MANAGE_REPLY *)tm->cm_reply;
 	ccb = tm->cm_complete_data;
 
-	/*
-	 * Currently there should be no way we can hit this case.  It only
-	 * happens when we have a failure to allocate chain frames, and
-	 * task management commands don't have S/G lists.
-	 */
-	if ((tm->cm_flags & MPS_CM_FLAGS_ERROR_MASK) != 0) {
-		MPI2_SCSI_TASK_MANAGE_REQUEST *req;
-
-		req = (MPI2_SCSI_TASK_MANAGE_REQUEST *)tm->cm_req;
-
-		mps_dprint(sc, MPS_ERROR,
-			   "%s: cm_flags = %#x for reset of handle %#04x! "
-			   "This should not happen!\n", __func__, tm->cm_flags,
-			   req->DevHandle);
-		mpssas_set_ccbstatus(ccb, CAM_REQ_CMP_ERR);
-		goto bailout;
-	}
-
 	mps_dprint(sc, MPS_XINFO,
 	    "%s: IOCStatus = 0x%x ResponseCode = 0x%x\n", __func__,
 	    le16toh(resp->IOCStatus), le32toh(resp->ResponseCode));
@@ -3256,8 +3198,6 @@ mpssas_resetdev_complete(struct mps_softc *sc, struct mps_command *tm)
 	}
 	else
 		mpssas_set_ccbstatus(ccb, CAM_REQ_CMP_ERR);
-
-bailout:
 
 	mpssas_free_tm(sc, tm);
 	xpt_done(ccb);
@@ -3615,6 +3555,7 @@ mpssas_prepare_for_tm(struct mps_softc *sc, struct mps_command *tm,
 			tm->cm_ccb = ccb;
 			tm->cm_targ = target;
 			target->flags |= MPSSAS_TARGET_INRESET;
+			target->frozen = 1;
 		}
 	}
 }
@@ -3667,16 +3608,6 @@ mpssas_portenable_complete(struct mps_softc *sc, struct mps_command *cm)
 
 	MPS_FUNCTRACE(sc);
 	sassc = sc->sassc;
-
-	/*
-	 * Currently there should be no way we can hit this case.  It only
-	 * happens when we have a failure to allocate chain frames, and
-	 * port enable commands don't have S/G lists.
-	 */
-	if ((cm->cm_flags & MPS_CM_FLAGS_ERROR_MASK) != 0) {
-		mps_dprint(sc, MPS_ERROR, "%s: cm_flags = %#x for port enable! "
-			   "This should not happen!\n", __func__, cm->cm_flags);
-	}
 
 	reply = (MPI2_PORT_ENABLE_REPLY *)cm->cm_reply;
 	if (reply == NULL)

@@ -76,6 +76,9 @@ __FBSDID("$FreeBSD$");
 #include <sys/conf.h>
 #include <sys/bio.h>
 #include <sys/malloc.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
+#include <sys/rmlock.h>
 #include <sys/uio.h>
 #include <sys/sysctl.h>
 #include <sys/ioccom.h>
@@ -721,9 +724,7 @@ mps_user_command(struct mps_softc *sc, struct mps_usr_command *cmd)
 	if (err != 0)
 		goto RetFreeUnlocked;
 
-	mps_qlock(cm->cm_q);
 	err = mps_wait_command(sc, cm, 60, CAN_SLEEP);
-	mps_qunlock(cm->cm_q);
 
 	if (err) {
 		mps_printf(sc, "%s: invalid request: error %d\n",
@@ -862,10 +863,8 @@ mps_user_pass_thru(struct mps_softc *sc, mps_pass_thru_t *data)
 			err = 1;
 		} else {
 			mps_unlock(sc);
-			mps_qlock(cm->cm_q);
 			mpssas_prepare_for_tm(sc, cm, targ, CAM_LUN_WILDCARD);
 			err = mps_wait_command(sc, cm, 30, CAN_SLEEP);
-			mps_qunlock(cm->cm_q);
 			mps_lock(sc);
 		}
 
@@ -1000,9 +999,7 @@ mps_user_pass_thru(struct mps_softc *sc, mps_pass_thru_t *data)
 		}
 	}
 
-	mps_qlock(cm->cm_q);
 	err = mps_wait_command(sc, cm, 30, CAN_SLEEP);
-	mps_qunlock(cm->cm_q);
 
 	if (err) {
 		mps_printf(sc, "%s: invalid request: error %d\n", __func__,

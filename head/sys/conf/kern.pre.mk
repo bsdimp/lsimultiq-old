@@ -85,8 +85,6 @@ INCLUDES+= -I$S/dev/twa
 # ... and the same for cxgb and cxgbe
 INCLUDES+= -I$S/dev/cxgb -I$S/dev/cxgbe
 
-INCLUDES+= -I$S/dev/mps/ck/include
-
 .endif
 
 CFLAGS=	${COPTFLAGS} ${DEBUG}

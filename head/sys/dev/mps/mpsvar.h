@@ -30,7 +30,7 @@
  * $FreeBSD$
  */
 
-#include <ck_ring.h>
+#include "ck_ring.h"
 
 #ifndef _MPSVAR_H
 #define _MPSVAR_H
@@ -39,7 +39,7 @@
 
 #define MPS_DB_MAX_WAIT		2500
 
-#define MPS_REQ_FRAMES		1024
+#define MPS_REQ_FRAMES		2048
 #define MPS_PRI_REQ_FRAMES	128
 #define MPS_EVT_REPLY_FRAMES	32
 #define MPS_REPLY_FRAMES	MPS_REQ_FRAMES
@@ -50,6 +50,7 @@
 #define MPS_SGE64_SIZE		12
 #define MPS_SGE32_SIZE		8
 #define MPS_SGC_SIZE		8
+#define MPS_CHAIN_LOWWATER	((MAXPHYS / PAGE_SIZE + 1) / 10)
 
 #define	 CAN_SLEEP			1
 #define  NO_SLEEP			0
@@ -238,8 +239,6 @@ struct mps_command {
 #define MPS_CM_FLAGS_DD_IO		(1 << 6)
 #define MPS_CM_FLAGS_USE_UIO		(1 << 7)
 #define MPS_CM_FLAGS_SMP_PASS		(1 << 8)
-#define	MPS_CM_FLAGS_CHAIN_FAILED	(1 << 9)
-#define	MPS_CM_FLAGS_ERROR_MASK		MPS_CM_FLAGS_CHAIN_FAILED
 #define	MPS_CM_FLAGS_USE_CCB		(1 << 10)
 #define	MPS_CM_FLAGS_SATA_ID_TIMEOUT	(1 << 11)
 	u_int				cm_state;
@@ -277,16 +276,12 @@ struct mps_queue {
 	ck_ring_t			req_ring;
 	ck_ring_t			chain_ring;
 	bus_dma_tag_t			buffer_dmat;
-	int				io_cmds_active;
 	int				io_cmds_highwater;
-	int				chain_free;
 	int				chain_free_lowwater;
-	uint64_t			chain_alloc_fail;
-	struct mtx			qmtx;
+	int				chain_alloc_fail;
 	struct resource			*irq;
 	void				*intrhand;
 	int				irq_rid;
-	char				name[8];
 };
 
 struct mps_softc {
@@ -475,190 +470,7 @@ struct scsi_read_capacity_eedp
 	uint8_t protect;
 };
 
-static __inline uint32_t
-mps_regread(struct mps_softc *sc, uint32_t offset)
-{
-	return (bus_space_read_4(sc->mps_btag, sc->mps_bhandle, offset));
-}
-
-static __inline void
-mps_regwrite(struct mps_softc *sc, uint32_t offset, uint32_t val)
-{
-	bus_space_write_4(sc->mps_btag, sc->mps_bhandle, offset, val);
-}
-
-/* free_queue must have Little Endian address 
- * TODO- cm_reply_data is unwanted. We can remove it.
- * */
-static __inline void
-mps_free_reply(struct mps_softc *sc, uint32_t busaddr)
-{
-	if (++sc->replyfreeindex >= sc->fqdepth)
-		sc->replyfreeindex = 0;
-	sc->free_queue[sc->replyfreeindex] = htole32(busaddr);
-	mps_regwrite(sc, MPI2_REPLY_FREE_HOST_INDEX_OFFSET, sc->replyfreeindex);
-}
-
-static __inline struct mps_chain *
-mps_alloc_chain(struct mps_queue *q)
-{
-	struct mps_chain *chain;
-
-	if (ck_ring_dequeue_spmc(&q->chain_ring, q->chainmem, &chain) != 0) {
-		atomic_add_int(&q->chain_free, -1);
-		if (q->chain_free < q->chain_free_lowwater)
-			q->chain_free_lowwater = q->chain_free;
-	}
-#if __FreeBSD_version >= 900030
-	else
-		q->chain_alloc_fail++;
-#endif
-	return (chain);
-}
-
-static __inline void
-mps_free_chain(struct mps_queue *q, struct mps_chain *chain)
-{
-	atomic_add_int(&q->chain_free, 1);
-	ck_ring_enqueue_spmc(&q->chain_ring, q->chainmem, chain);
-}
-
-static __inline void
-mps_qfree_command(struct mps_command *cm, struct mps_queue *q)
-{
-	struct mps_chain *chain;
-
-	if (cm->cm_reply != NULL)
-		mps_free_reply(cm->cm_sc, cm->cm_reply_data);
-	cm->cm_reply = NULL;
-	cm->cm_flags = 0;
-	cm->cm_complete = NULL;
-	cm->cm_complete_data = NULL;
-	cm->cm_ccb = NULL;
-	cm->cm_targ = NULL;
-	cm->cm_max_segs = 0;
-	cm->cm_lun = 0;
-	cm->cm_state = MPS_CM_STATE_FREE;
-	cm->cm_data = NULL;
-	cm->cm_length = 0;
-	cm->cm_out_len = 0;
-	cm->cm_sglsize = 0;
-	cm->cm_sge = NULL;
-
-	while ((chain = STAILQ_FIRST(&cm->cm_chain_list)) != NULL) {
-		STAILQ_REMOVE_HEAD(&cm->cm_chain_list, chain_slink);
-		mps_free_chain(q, chain);
-	}
-
-	if (q->io_cmds_active != 0) {
-		atomic_add_int(&q->io_cmds_active, -1);
-	}
-
-	ck_ring_enqueue_spmc(&q->req_ring, q->ringmem, cm);
-}
-
-static __inline void
-mps_free_command(struct mps_softc *sc, struct mps_command *cm)
-{
-	struct mps_queue *q;
-
-	q = cm->cm_q;
-	mps_qfree_command(cm, q);
-}
-
-static __inline struct mps_command *
-mps_qalloc_command(struct mps_queue *q)
-{
-	struct mps_command *cm;
-
-	if (ck_ring_dequeue_spmc(&q->req_ring, q->ringmem, &cm) == 0)
-		return (NULL);
-
-	KASSERT(cm->cm_state == MPS_CM_STATE_FREE,
-	    ("mps: Allocating busy command\n"));
-	cm->cm_state = MPS_CM_STATE_BUSY;
-	atomic_add_int(&q->io_cmds_active, 1);
-	if (q->io_cmds_active > q->io_cmds_highwater)
-		q->io_cmds_highwater = q->io_cmds_active;
-
-	return (cm);
-}
-
-/*
- * Allocs a command.  Returns with the queue locked.
- */
-static __inline struct mps_command *
-mps_alloc_command(struct mps_softc *sc)
-{
-	struct mps_command *cm;
-	struct mps_queue *q;
-
-	q = sc->queues[curcpu % sc->numqueues];
-	if (q == NULL)
-		return (NULL);
-
-	cm = mps_qalloc_command(q);
-	return (cm);
-}
-
-static __inline void
-mps_free_high_priority_command(struct mps_softc *sc, struct mps_command *cm)
-{
-
-	if (cm->cm_reply != NULL)
-		mps_free_reply(sc, cm->cm_reply_data);
-	cm->cm_reply = NULL;
-	cm->cm_flags = 0;
-	cm->cm_complete = NULL;
-	cm->cm_complete_data = NULL;
-	cm->cm_ccb = NULL;
-	cm->cm_targ = NULL;
-	cm->cm_lun = 0;
-	cm->cm_state = MPS_CM_STATE_FREE;
-	KASSERT(&cm->cm_chain_list,
-	    ("Chain frames with a high priority command?\n"));
-	STAILQ_INSERT_HEAD(&sc->high_priority_req_list, cm, cm_slink);
-}
-
-static __inline struct mps_command *
-mps_alloc_high_priority_command(struct mps_softc *sc)
-{
-	struct mps_command *cm;
-
-	cm = STAILQ_FIRST(&sc->high_priority_req_list);
-	if (cm == NULL)
-		return (NULL);
-
-	STAILQ_REMOVE_HEAD(&sc->high_priority_req_list, cm_slink);
-	KASSERT(cm->cm_state == MPS_CM_STATE_FREE,
-	    ("mps: Allocating busy command\n"));
-	cm->cm_state = MPS_CM_STATE_BUSY;
-	return (cm);
-}
-
-static __inline void
-mps_lock(struct mps_softc *sc)
-{
-	mtx_lock(&sc->mps_mtx);
-}
-
-static __inline void
-mps_unlock(struct mps_softc *sc)
-{
-	mtx_unlock(&sc->mps_mtx);
-}
-
-static __inline void
-mps_qlock(struct mps_queue *q)
-{
-	mtx_lock(&q->qmtx);
-}
-
-static __inline void
-mps_qunlock(struct mps_queue *q)
-{
-	mtx_unlock(&q->qmtx);
-}
+extern struct timeval mps_chainfail_interval;
 
 #define MPS_INFO	(1 << 0)	/* Basic info */
 #define MPS_FAULT	(1 << 1)	/* Hardware faults */
@@ -671,11 +483,6 @@ mps_qunlock(struct mps_queue *q)
 #define MPS_USER	(1 << 8)	/* Trace user-generated commands */
 #define MPS_MAPPING	(1 << 9)	/* Trace device mappings */
 #define MPS_TRACE	(1 << 10)	/* Function-by-function trace */
-
-#define	MPS_SSU_DISABLE_SSD_DISABLE_HDD	0
-#define	MPS_SSU_ENABLE_SSD_DISABLE_HDD	1
-#define	MPS_SSU_DISABLE_SSD_ENABLE_HDD	2
-#define	MPS_SSU_ENABLE_SSD_ENABLE_HDD	3
 
 #define mps_printf(sc, args...)				\
 	device_printf((sc)->mps_dev, ##args)
@@ -714,6 +521,194 @@ do {								\
 
 #define MPS_FUNCTRACE(sc)			\
 	mps_dprint((sc), MPS_TRACE, "%s\n", __func__)
+
+static __inline uint32_t
+mps_regread(struct mps_softc *sc, uint32_t offset)
+{
+	return (bus_space_read_4(sc->mps_btag, sc->mps_bhandle, offset));
+}
+
+static __inline void
+mps_regwrite(struct mps_softc *sc, uint32_t offset, uint32_t val)
+{
+	bus_space_write_4(sc->mps_btag, sc->mps_bhandle, offset, val);
+}
+
+/* free_queue must have Little Endian address 
+ * TODO- cm_reply_data is unwanted. We can remove it.
+ * */
+static __inline void
+mps_free_reply(struct mps_softc *sc, uint32_t busaddr)
+{
+	if (++sc->replyfreeindex >= sc->fqdepth)
+		sc->replyfreeindex = 0;
+	sc->free_queue[sc->replyfreeindex] = htole32(busaddr);
+	mps_regwrite(sc, MPI2_REPLY_FREE_HOST_INDEX_OFFSET, sc->replyfreeindex);
+}
+
+static __inline struct mps_chain *
+mps_alloc_chain(struct mps_queue *q)
+{
+	struct mps_chain *chain;
+	u_int val;
+
+	/* XXX Would be nice to have ck_ring_dequeue_spmc_size() */
+	if (ck_ring_dequeue_spmc(&q->chain_ring, q->chainmem, &chain) != 0) {
+		val = ck_ring_size(&q->chain_ring);
+		if (val < q->chain_free_lowwater)
+			q->chain_free_lowwater = val;
+	}
+#if __FreeBSD_version >= 900030
+	else
+		atomic_add_int(&q->chain_alloc_fail, 1);;
+#endif
+	return (chain);
+}
+
+static __inline void
+mps_free_chain(struct mps_queue *q, struct mps_chain *chain)
+{
+	ck_ring_enqueue_spmc(&q->chain_ring, q->chainmem, chain);
+}
+
+static __inline void
+mps_qfree_command(struct mps_command *cm, struct mps_queue *q)
+{
+	struct mps_chain *chain;
+
+	if (cm->cm_reply != NULL)
+		mps_free_reply(cm->cm_sc, cm->cm_reply_data);
+	cm->cm_reply = NULL;
+	cm->cm_flags = 0;
+	cm->cm_complete = NULL;
+	cm->cm_complete_data = NULL;
+	cm->cm_ccb = NULL;
+	cm->cm_targ = NULL;
+	cm->cm_max_segs = 0;
+	cm->cm_lun = 0;
+	cm->cm_state = MPS_CM_STATE_FREE;
+	cm->cm_data = NULL;
+	cm->cm_length = 0;
+	cm->cm_out_len = 0;
+	cm->cm_sglsize = 0;
+	cm->cm_sge = NULL;
+
+	while ((chain = STAILQ_FIRST(&cm->cm_chain_list)) != NULL) {
+		STAILQ_REMOVE_HEAD(&cm->cm_chain_list, chain_slink);
+		mps_free_chain(q, chain);
+	}
+
+	ck_ring_enqueue_spmc(&q->req_ring, q->ringmem, cm);
+}
+
+static __inline void
+mps_free_command(struct mps_softc *sc, struct mps_command *cm)
+{
+	struct mps_queue *q;
+
+	q = cm->cm_q;
+	mps_qfree_command(cm, q);
+}
+
+static __inline struct mps_command *
+mps_qalloc_command(struct mps_queue *q)
+{
+	struct mps_command *cm;
+	u_int val;
+
+	if (ck_ring_dequeue_spmc(&q->req_ring, q->ringmem, &cm) == 0)
+		return (NULL);
+
+	KASSERT(cm->cm_state == MPS_CM_STATE_FREE,
+	    ("mps: Allocating busy command\n"));
+	cm->cm_state = MPS_CM_STATE_BUSY;
+	val = ck_ring_size(&q->req_ring);
+	if (val > q->io_cmds_highwater)
+		q->io_cmds_highwater = val;
+
+	return (cm);
+}
+
+/*
+ * Allocs a command.  A critical section is needed if size is used.
+ */
+static __inline struct mps_command *
+mps_alloc_command_size(struct mps_softc *sc, size_t size)
+{
+	struct mps_command *cm;
+	struct mps_queue *q;
+
+	q = sc->queues[curcpu % sc->numqueues];
+	if (q == NULL)
+		return (NULL);
+
+	/*
+	 * Most command frames can hold at least 2 SG Elements;
+	 * any buffer that is a page size or less can have as
+	 * many as two segments.
+	 */
+	if (size > PAGE_SIZE) {
+		if (ck_ring_size(&q->chain_ring) < MPS_CHAIN_LOWWATER) {
+			if (ratecheck(&sc->lastfail, &mps_chainfail_interval))
+				mps_dprint(sc, MPS_INFO, "Out of chain frames, "
+				    "consider increasing hw.mps.max_chains.\n");
+			return (NULL);
+		}
+	}
+
+	cm = mps_qalloc_command(q);
+	return (cm);
+}
+
+static __inline struct mps_command *
+mps_alloc_command(struct mps_softc *sc)
+{
+	return (mps_alloc_command_size(sc, 0));
+}
+
+static __inline void
+mps_free_high_priority_command(struct mps_softc *sc, struct mps_command *cm)
+{
+
+	if (cm->cm_reply != NULL)
+		mps_free_reply(sc, cm->cm_reply_data);
+	cm->cm_reply = NULL;
+	cm->cm_flags = 0;
+	cm->cm_complete = NULL;
+	cm->cm_complete_data = NULL;
+	cm->cm_ccb = NULL;
+	cm->cm_targ = NULL;
+	cm->cm_lun = 0;
+	cm->cm_state = MPS_CM_STATE_FREE;
+	KASSERT(&cm->cm_chain_list,
+	    ("Chain frames with a high priority command?\n"));
+	STAILQ_INSERT_HEAD(&sc->high_priority_req_list, cm, cm_slink);
+}
+
+static __inline struct mps_command *
+mps_alloc_high_priority_command(struct mps_softc *sc)
+{
+	struct mps_command *cm;
+
+	cm = STAILQ_FIRST(&sc->high_priority_req_list);
+	if (cm == NULL)
+		return (NULL);
+
+	STAILQ_REMOVE_HEAD(&sc->high_priority_req_list, cm_slink);
+	KASSERT(cm->cm_state == MPS_CM_STATE_FREE,
+	    ("mps: Allocating busy command\n"));
+	cm->cm_state = MPS_CM_STATE_BUSY;
+	return (cm);
+}
+
+#define mps_lock(sc)		mtx_lock(&(sc)->mps_mtx)
+#define mps_unlock(sc)		mtx_unlock(&(sc)->mps_mtx)
+#define mps_trylock(sc) 	mtx_trylock(&(sc)->mps_mtx)
+
+#define	MPS_SSU_DISABLE_SSD_DISABLE_HDD	0
+#define	MPS_SSU_ENABLE_SSD_DISABLE_HDD	1
+#define	MPS_SSU_DISABLE_SSD_ENABLE_HDD	2
+#define	MPS_SSU_ENABLE_SSD_ENABLE_HDD	3
 
 #define  CAN_SLEEP                      1
 #define  NO_SLEEP                       0

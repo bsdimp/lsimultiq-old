@@ -130,6 +130,7 @@ struct pass_softc {
 	u_int8_t		  pd_type;
 	union ccb		  saved_ccb;
 	int			  open_count;
+	u_int			  maxio;
 	struct devstat		 *device_stats;
 	struct cdev		 *dev;
 	struct cdev		 *alias_dev;
@@ -146,7 +147,6 @@ struct pass_softc {
 	uma_zone_t		  pass_zone;
 	uma_zone_t		  pass_io_zone;
 	size_t			  io_zone_size;
-	int			  cpi_maxio;
 };
 
 static	d_open_t	passopen;
@@ -591,9 +591,12 @@ passregister(struct cam_periph *periph, void *arg)
 	cpi.ccb_h.func_code = XPT_PATH_INQ;
 	xpt_action((union ccb *)&cpi);
 
-	softc->cpi_maxio = cpi.maxio;
-	if (softc->cpi_maxio == 0)
-		softc->cpi_maxio = DFLTPHYS;
+	if (cpi.maxio == 0)
+		softc->maxio = DFLTPHYS;	/* traditional default */
+	else if (cpi.maxio > MAXPHYS)
+		softc->maxio = MAXPHYS;		/* for safety */
+	else
+		softc->maxio = cpi.maxio;	/* real value */
 
 	if (cpi.hba_misc & PIM_UNMAPPED)
 		softc->flags |= PASS_FLAG_UNMAPPED_CAPABLE;
@@ -1332,7 +1335,7 @@ passmemsetup(struct cam_periph *periph, struct pass_io_req *io_req)
 		num_segs = ccb->csio.sglist_cnt;
 		seg_cnt_ptr = &ccb->csio.sglist_cnt;
 		numbufs = 1;
-		maxmap = softc->cpi_maxio;
+		maxmap = softc->maxio;
 		break;
 	case XPT_ATA_IO:
 		if ((ccb->ccb_h.flags & CAM_DIR_MASK) == CAM_DIR_NONE)
@@ -1350,7 +1353,7 @@ passmemsetup(struct cam_periph *periph, struct pass_io_req *io_req)
 		lengths[0] = ccb->ataio.dxfer_len;
 		dirs[0] = ccb->ccb_h.flags & CAM_DIR_MASK;
 		numbufs = 1;
-		maxmap = softc->cpi_maxio;
+		maxmap = softc->maxio;
 		break;
 	case XPT_SMP_IO:
 		io_req->data_flags = CAM_DATA_VADDR;
@@ -1362,7 +1365,7 @@ passmemsetup(struct cam_periph *periph, struct pass_io_req *io_req)
 		lengths[1] = ccb->smpio.smp_response_len;
 		dirs[1] = CAM_DIR_IN;
 		numbufs = 2;
-		maxmap = softc->cpi_maxio;
+		maxmap = softc->maxio;
 		break;
 	case XPT_DEV_ADVINFO:
 		if (ccb->cdai.bufsiz == 0)
@@ -2173,7 +2176,7 @@ passsendccb(struct cam_periph *periph, union ccb *ccb, union ccb *inccb)
 		 * Dropping it here is reasonably safe.
 		 */
 		cam_periph_unlock(periph);
-		error = cam_periph_mapmem(ccb, &mapinfo); 
+		error = cam_periph_mapmem(ccb, &mapinfo, softc->maxio);
 		cam_periph_lock(periph);
 
 		/*
